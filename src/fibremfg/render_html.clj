@@ -1,0 +1,783 @@
+(ns fibremfg.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2 for this repo: it previously had a
+  README and a demo driver (`clojure -M:dev:run`) but NO operator page
+  and no generator. Nothing on the generated page is hand-written --
+  `run-demo!` actually drives this repo's own actor stack
+  (`fibremfg.operation`'s langgraph StateGraph -> `fibremfg.advisor`
+  -> `fibremfg.governor` -> `fibremfg.phase` -> `fibremfg.store`) and
+  `render` is a pure function of the resulting store + the real run
+  results. Every batch id, equipment id, weight, denier, maintenance
+  number (`MNT-…`), shipment number (`SHP-…`), hold rule and hold
+  detail string on the page is whatever the actor produced.
+
+  Determinism: no timestamps, no clock reads, no randomness; the store
+  is seeded fresh from `fibremfg.store/sample-data!` on every run and
+  every collection rendered is either an append-only log (natural
+  order) or explicitly sorted. Two consecutive runs are byte-identical.
+
+  Refusal: `-main` throws and writes NOTHING when the run produced zero
+  HARD governor holds. A console for a governed actor that shows no
+  real refusal is theatre, and this generator will not emit one.
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [jp-go-dds.skin]
+            [clojure.string :as str]
+            [langgraph.graph :as g]
+            [fibremfg.advisor :as advisor]
+            [fibremfg.governor :as governor]
+            [fibremfg.operation :as op]
+            [fibremfg.phase :as phase]
+            [fibremfg.registry :as registry]
+            [fibremfg.store :as store]))
+
+;; ----------------------------- scenario -----------------------------
+
+(def ^:private coordinator
+  "The plant coordinator identity injected as `:context` -- the same
+  shape `fibremfg.sim` uses (`:phase 3` = supervised-auto)."
+  {:actor-id "coord-1" :actor-role :plant-coordinator :phase 3})
+
+(def ^:private coordinator-phase-1
+  "Same coordinator, but running under the phase-1 (assisted-intake)
+  rollout stage -- used once below to show the phase gate refusing an
+  op the governor itself had already cleared."
+  (assoc coordinator :phase 1))
+
+(defn- fabricated-effect-advisor
+  "A DELIBERATELY compromised advisor: it produces this repo's own
+  normal proposal and then swaps the proposal's `:effect` for a
+  fabricated direct spinning/extrusion-line control effect. This is
+  the containment property the actor exists for -- the advisor is
+  untrusted, so the governor's closed proposal-effect allowlist
+  (`fibremfg.governor/allowed-proposal-effects`) must HARD-hold it on
+  its own, with a well-formed op and a verified, registered piece of
+  equipment. Nothing else in the run is allowed to depend on this
+  advisor."
+  []
+  (reify advisor/Advisor
+    (-advise [_ st req]
+      (assoc (advisor/infer st req) :effect :line/actuate))))
+
+(defn- low-confidence-advisor
+  "An advisor whose inference lands UNDER
+  `fibremfg.governor/confidence-floor` -- the only way to exercise the
+  SOFT confidence gate on an op the mock advisor is otherwise always
+  confident about. A SOFT gate escalates to a human, who may approve;
+  it is not a HARD hold."
+  []
+  (reify advisor/Advisor
+    (-advise [_ st req]
+      (assoc (advisor/infer st req) :confidence 0.42))))
+
+(defn- exec!
+  "One coordination request = one supervised actor run."
+  [actor tid ctx request]
+  (g/run* actor {:request request :context ctx} {:thread-id tid}))
+
+(defn- resume!
+  "Resume an interrupt-before-paused thread with a human decision."
+  [actor tid status by]
+  (g/run* actor {:approval {:status status :by by}}
+          {:thread-id tid :resume? true}))
+
+(defn run-demo!
+  "Drives a freshly seeded store (`fibremfg.store/sample-data!` --
+  batch-001/002/003, spinning-line-001, extrusion-line-002) through
+  every disposition this actor can reach, and returns
+  `{:db store :runs [..]}`.
+
+    A. clean lifecycle on the verified, registered polyester batch
+       batch-001 and the verified, registered spinning-line-001:
+       production-batch logging (phase-3 auto-commit, the ONLY
+       auto-eligible op), a spinneret-inspection maintenance window
+       (escalates -- `:schedule-maintenance` is never auto at any
+       phase -- approved), a safety-concern flag (always escalates --
+       approved) and a 5,000 kg outbound shipment (escalates,
+       approved).
+    B. both human outcomes, plus the SOFT confidence gate: a second
+       shipment the human REJECTS (soft hold -- it DID reach a human),
+       a safety concern raised against the UNVERIFIED
+       extrusion-line-002 (safety reporting is deliberately never
+       gated on verification status -- approved), and a
+       production-batch log driven by an under-confident advisor
+       (escalates on the confidence floor -- approved).
+    C. the phase gate: a shipment the GOVERNOR clears, held anyway
+       because phase 1 does not enable `:coordinate-shipment`.
+    D. the shipment-weight boundary: a shipment that fills batch-001
+       EXACTLY to its recorded 40,000 kg (legal -- commits), then a
+       0.5 kg shipment against the now-full batch (HARD hold).
+    E. thirteen HARD holds covering all ten of this governor's HARD
+       rules, each exercised directly rather than only via a
+       happy-path actuation.
+
+  Every HARD hold in E (and D's over-fill) is written to the ledger
+  without ever reaching a human."
+  []
+  (let [db (-> (store/mem-store) (store/sample-data!))
+        actor (op/build db)
+        rogue (op/build db {:advisor (fabricated-effect-advisor)})
+        unsure (op/build db {:advisor (low-confidence-advisor)})
+        runs (atom [])
+        run! (fn [a tid label ctx request & [approval]]
+               (let [r0 (exec! a tid ctx request)
+                     r (if approval
+                         (resume! a tid (:status approval) (:by approval))
+                         r0)]
+                 (swap! runs conj {:thread tid :label label :phase (:phase ctx)
+                                   :request request :approval approval
+                                   :status (:status r) :result r})
+                 r))]
+
+    ;; ---- A. clean lifecycle -------------------------------------------
+    (run! actor "t01" "生産バッチ記録 batch-001 (governor clean -> phase-3 自動コミット)"
+          coordinator
+          {:op :log-production-batch :effect :propose :subject "batch-001"
+           :patch {:fibre-type :polyester :last-assessed "2026-07-14"}})
+
+    (run! actor "t02" "保守作業予定 mnt-1 / spinning-line-001 (検証・登録済み -> 承認)"
+          coordinator
+          {:op :schedule-maintenance :effect :propose :subject "mnt-1"
+           :value {:equipment-id "spinning-line-001" :maintenance-type :spinneret-inspection
+                   :scheduled-date "2026-08-01" :actuate-line? false}}
+          {:status :approved :by "coord-1"})
+
+    (run! actor "t03" "安全懸念 concern-1 / spinning-line-001 (常に人間承認 -> 承認)"
+          coordinator
+          {:op :flag-safety-concern :effect :propose :subject "concern-1"
+           :value {:equipment-id "spinning-line-001" :severity :moderate
+                   :description "紡糸ライン周辺の溶剤臭気上昇、換気系統の点検要"}}
+          {:status :approved :by "coord-1"})
+
+    (run! actor "t04" "出荷調整 ship-1 / batch-001 5,000 kg (空き容量内 -> 承認)"
+          coordinator
+          {:op :coordinate-shipment :effect :propose :subject "ship-1"
+           :value {:batch-id "batch-001" :weight-kg 5000.0
+                   :destination "buyer-yard-north"}}
+          {:status :approved :by "coord-1"})
+
+    ;; ---- B. both human outcomes + the SOFT confidence gate --------------
+    (run! actor "t05" "出荷調整 ship-4 / batch-001 2,000 kg (人間が却下 -> SOFT hold)"
+          coordinator
+          {:op :coordinate-shipment :effect :propose :subject "ship-4"
+           :value {:batch-id "batch-001" :weight-kg 2000.0
+                   :destination "buyer-yard-north"}}
+          {:status :rejected :by "coord-1"})
+
+    (run! actor "t06" "安全懸念 concern-2 / extrusion-line-002 (未検証設備でも安全報告は阻害しない -> 承認)"
+          coordinator
+          {:op :flag-safety-concern :effect :propose :subject "concern-2"
+           :value {:equipment-id "extrusion-line-002" :severity :high
+                   :description "未検証・未登録の押出ラインに対する安全懸念 -- 検証状態を理由に安全報告を止めない"}}
+          {:status :approved :by "coord-1"})
+
+    (run! unsure "t07" "生産バッチ記録 batch-002 (advisor 確信度 0.42 < 0.6 -> SOFT escalate -> 承認)"
+          coordinator
+          {:op :log-production-batch :effect :propose :subject "batch-002"
+           :patch {:fibre-type :viscose-rayon :last-assessed "2026-07-14"}}
+          {:status :approved :by "coord-1"})
+
+    ;; ---- C. phase gate ------------------------------------------------
+    (run! actor "t08" "出荷調整 ship-9 / batch-001 100 kg を phase 1 で実行 (governor は clean、phase が hold)"
+          coordinator-phase-1
+          {:op :coordinate-shipment :effect :propose :subject "ship-9"
+           :value {:batch-id "batch-001" :weight-kg 100.0
+                   :destination "buyer-yard-north"}})
+
+    ;; ---- D. weight boundary: exact fill is legal, one more kg is not ----
+    (run! actor "t09" "出荷調整 ship-5 / batch-001 27,000 kg (記録生産量 40,000 kg に丁度一致 -> 承認)"
+          coordinator
+          {:op :coordinate-shipment :effect :propose :subject "ship-5"
+           :value {:batch-id "batch-001" :weight-kg 27000.0
+                   :destination "buyer-yard-north"}}
+          {:status :approved :by "coord-1"})
+
+    (run! actor "t10" "出荷調整 ship-6 / batch-001 0.5 kg (満量後の追加 -> HARD hold)"
+          coordinator
+          {:op :coordinate-shipment :effect :propose :subject "ship-6"
+           :value {:batch-id "batch-001" :weight-kg 0.5
+                   :destination "buyer-yard-north"}})
+
+    ;; ---- E. the ten HARD rules ----------------------------------------
+    (run! actor "t11" "request :effect が :propose でない (mis-wired caller -> HARD hold)"
+          coordinator
+          {:op :log-production-batch :effect :direct-write :subject "batch-001"
+           :patch {:fibre-type :polyester}})
+
+    (run! actor "t12" "許可リストに無い op :actuate-spinning-line (-> HARD hold)"
+          coordinator
+          {:op :actuate-spinning-line :effect :propose :subject "batch-001"})
+
+    (run! rogue "t13" "compromised advisor が proposal :effect を :line/actuate に偽装 (-> HARD hold)"
+          coordinator
+          {:op :schedule-maintenance :effect :propose :subject "mnt-4"
+           :value {:equipment-id "spinning-line-001" :maintenance-type :spinneret-inspection
+                   :scheduled-date "2026-09-15" :actuate-line? false}})
+
+    (run! actor "t14" "保守作業予定 mnt-3 が :actuate-line? true (恒久禁止 -> HARD hold)"
+          coordinator
+          {:op :schedule-maintenance :effect :propose :subject "mnt-3"
+           :value {:equipment-id "spinning-line-001" :maintenance-type :force-run
+                   :scheduled-date "2026-09-01" :actuate-line? true}})
+
+    (run! actor "t15" "保守作業予定 mnt-2 / extrusion-line-002 (未検証・未登録設備 -> HARD hold)"
+          coordinator
+          {:op :schedule-maintenance :effect :propose :subject "mnt-2"
+           :value {:equipment-id "extrusion-line-002" :maintenance-type :die-inspection
+                   :scheduled-date "2026-08-01" :actuate-line? false}})
+
+    (run! actor "t16" "保守作業予定 mnt-1 を再提出 (二重スケジュール -> HARD hold)"
+          coordinator
+          {:op :schedule-maintenance :effect :propose :subject "mnt-1"
+           :value {:equipment-id "spinning-line-001" :maintenance-type :spinneret-inspection
+                   :scheduled-date "2026-08-01" :actuate-line? false}})
+
+    (run! actor "t17" "出荷調整 ship-2 / batch-003 1,000 kg (未検証・未登録バッチ -> HARD hold)"
+          coordinator
+          {:op :coordinate-shipment :effect :propose :subject "ship-2"
+           :value {:batch-id "batch-003" :weight-kg 1000.0
+                   :destination "buyer-yard-south"}})
+
+    (run! actor "t18" "出荷調整 ship-3 / batch-002 1,000 kg (7,500+1,000 > 8,000 -> HARD hold)"
+          coordinator
+          {:op :coordinate-shipment :effect :propose :subject "ship-3"
+           :value {:batch-id "batch-002" :weight-kg 1000.0
+                   :destination "buyer-yard-east"}})
+
+    (run! actor "t19" "出荷調整 ship-7 / batch-001 申請量の記載なし (検算不能 -> HARD hold)"
+          coordinator
+          {:op :coordinate-shipment :effect :propose :subject "ship-7"
+           :value {:batch-id "batch-001" :destination "buyer-yard-north"}})
+
+    (run! actor "t20" "出荷調整 ship-8 / batch-003 申請量の記載なし (未検証 + 検算不能 -> HARD hold 2件)"
+          coordinator
+          {:op :coordinate-shipment :effect :propose :subject "ship-8"
+           :value {:batch-id "batch-003" :destination "buyer-yard-south"}})
+
+    (run! actor "t21" "生産バッチ記録 batch-001 に捏造 fibre-type :unobtainium (-> HARD hold)"
+          coordinator
+          {:op :log-production-batch :effect :propose :subject "batch-001"
+           :patch {:fibre-type :unobtainium}})
+
+    (run! actor "t22" "生産バッチ記録 batch-001 に非現実的な denier -5.0 (-> HARD hold)"
+          coordinator
+          {:op :log-production-batch :effect :propose :subject "batch-001"
+           :patch {:denier -5.0}})
+
+    {:db db :runs @runs}))
+
+;; ----------------------------- ledger classification -----------------------------
+
+(defn hard-holds
+  "The HARD governor holds on `db`'s ledger: a `:governor-hold` fact
+  carrying at least one violated rule in `:basis`. These are the holds
+  that NEVER reach a human -- distinct from
+    - a phase hold (`:governor-hold` with an empty `:basis` and a
+      `:phase-reason`), which the governor itself had cleared, and
+    - an `:approval-rejected` fact, which is a human's own decision on
+      a SOFT escalation.
+  `-main` refuses to write the console when this is empty."
+  [db]
+  (filterv #(and (= :governor-hold (:t %)) (seq (:basis %)))
+           (store/ledger db)))
+
+(defn- phase-holds [db]
+  (filterv #(and (= :governor-hold (:t %)) (empty? (:basis %)))
+           (store/ledger db)))
+
+(defn- rejected-holds [db]
+  (filterv #(= :approval-rejected (:t %)) (store/ledger db)))
+
+(defn- commits [db]
+  (filterv #(= :committed (:t %)) (store/ledger db)))
+
+(defn- hard-rule-tally
+  "rule -> {:rule .. :count n :details [distinct detail strings, order of
+  first appearance]} for every HARD rule that actually fired."
+  [db]
+  (let [vs (for [f (hard-holds db), v (:violations f)] v)]
+    (->> (group-by :rule vs)
+         (map (fn [[rule violations]]
+                {:rule rule
+                 :count (count violations)
+                 :details (vec (distinct (map :detail violations)))}))
+         (sort-by (comp str :rule))
+         vec)))
+
+;; ----------------------------- approver attribution probe -----------------------------
+
+(def ^:private approver-keys
+  "Keys any surface could plausibly use to retain the approving human."
+  #{:approved-by :approver :approved_by :by})
+
+(defn- approver-hits
+  "Every place in `m` (a flat record map) that names an approver."
+  [m]
+  (when (map? m)
+    (seq (for [[k v] m :when (contains? approver-keys k)] [k v]))))
+
+(defn- shipment-ids
+  "Shipment ids the store actually kept, read back out of the
+  append-only shipment-coordination draft history (the store protocol
+  exposes `shipment` by id but no `all-shipments`)."
+  [db]
+  (->> (store/shipment-history db)
+       (map #(get % "shipment_id"))
+       (remove nil?)
+       distinct
+       sort
+       vec))
+
+(defn- approver-probe
+  "Measured, at render time, rather than asserted: walk every surface
+  this actor writes and report whether the approving human's id
+  survived into it. Returns [{:surface .. :n .. :hits [..]} ..].
+
+  `fibremfg.operation`'s `:request-approval` node builds
+  `(assoc (commit-record ..) :payload (assoc (:value proposal)
+  :approved-by (:by approval)))` -- so whether the id lands anywhere
+  durable depends on what `fibremfg.store/commit-record!` reads. This
+  function does not assume the answer; it looks."
+  [db runs]
+  (let [surface (fn [label records]
+                  {:surface label
+                   :n (count records)
+                   :hits (vec (mapcat approver-hits records))})]
+    [(surface "監査台帳 fibremfg.store/ledger (永続)" (vec (store/ledger db)))
+     (surface "バッチ記録 store/all-batches (永続)" (vec (store/all-batches db)))
+     (surface "設備記録 store/all-equipment (永続)" (vec (store/all-equipment db)))
+     (surface "保守作業予定 store/all-maintenance (永続)" (vec (store/all-maintenance db)))
+     (surface "出荷記録 store/shipment (永続)" (mapv #(store/shipment db %) (shipment-ids db)))
+     (surface "安全懸念 store/safety-concerns (永続)" (vec (store/safety-concerns db)))
+     (surface "汎用 records store/get-records (永続)"
+              (mapv second (sort-by first (store/get-records db))))
+     (surface "実行中の :audit channel (実行時のみ / 永続化されない)"
+              (vec (for [{:keys [result]} runs
+                         f (get-in result [:state :audit])]
+                     f)))]))
+
+(defn- approval-events
+  "The human decisions this run actually produced, read out of each
+  thread's own `:audit` channel (the actor's in-run record)."
+  [runs]
+  (vec (for [{:keys [thread label result]} runs
+             f (get-in result [:state :audit])
+             :when (#{:approval-requested :approval-granted :approval-rejected} (:t f))]
+         {:thread thread :label label :t (:t f) :op (:op f)
+          :subject (:subject f) :by (:by f) :reason (:reason f)
+          :confidence (:confidence f)})))
+
+;; ----------------------------- html helpers -----------------------------
+
+(defn- esc [v]
+  (-> (str v)
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")
+      (str/replace "\"" "&quot;")))
+
+(defn- code [v] (str "<code>" (esc v) "</code>"))
+
+(defn- flag
+  "A boolean rendered as a status cell, never colour alone."
+  [b yes no]
+  (if b
+    (str "<span class=\"ok\">✔ " (esc yes) "</span>")
+    (str "<span class=\"err\">✘ " (esc no) "</span>")))
+
+(defn- cells [xs] (str "        <tr>" (str/join (map #(str "<td>" % "</td>") xs)) "</tr>"))
+
+(defn- table [headers rows]
+  (str "    <table>\n"
+       "      <thead><tr>" (str/join (map #(str "<th>" (esc %) "</th>") headers)) "</tr></thead>\n"
+       "      <tbody>\n"
+       (if (seq rows) (str (str/join "\n" rows) "\n")
+           (str "        <tr><td colspan=\"" (count headers)
+                "\"><span class=\"muted\">この実行では該当なし</span></td></tr>\n"))
+       "      </tbody>\n"
+       "    </table>\n"))
+
+(defn- section [title lead body]
+  (str "  <section class=\"card\">\n"
+       "    <h2>" (esc title) "</h2>\n"
+       (when lead (str "    <p class=\"muted\">" lead "</p>\n"))
+       body
+       "  </section>\n"))
+
+(defn- kw-list [kws]
+  (str/join "、" (map #(code (str %)) (sort-by str kws))))
+
+;; ----------------------------- sections -----------------------------
+
+(defn- summary-section [db runs]
+  (let [ledger (store/ledger db)]
+    (section
+     "この実行の要約"
+     (str "下の数値はすべて、この生成時に " (code "fibremfg.operation")
+          " のグラフを実際に走らせた結果を数えたもの。手書きの数値はこのページに1つも無い。")
+     (table ["指標" "件数" "意味"]
+            [(cells [(esc "コーディネーション要求 (= actor 実行)") (str "<span class=\"num\">" (count runs) "</span>")
+                     (esc "1要求 = 1回の supervised actor run (intake→advise→govern→decide→commit|hold|approval)")])
+             (cells [(esc "台帳フィルタ: :committed") (str "<span class=\"num\">" (count (commits db)) "</span>")
+                     (esc "SSoT へ書き込まれたもの (自動コミット + 人間承認後のコミット)")])
+             (cells [(str "<span class=\"critical\">" (esc "HARD hold (人間に届かない)") "</span>")
+                     (str "<span class=\"num\">" (count (hard-holds db)) "</span>")
+                     (esc "governor の HARD ルール違反。phase でも人間承認でも覆せない")])
+             (cells [(esc "distinct な HARD ルール") (str "<span class=\"num\">" (count (hard-rule-tally db)) "</span>")
+                     (esc "この実行で実際に発火した governor HARD ルールの種類数")])
+             (cells [(str "<span class=\"warn\">" (esc "phase hold") "</span>")
+                     (str "<span class=\"num\">" (count (phase-holds db)) "</span>")
+                     (esc "governor は通したが、その phase では書き込みが有効化されていない")])
+             (cells [(str "<span class=\"warn\">" (esc "人間が却下 (SOFT)") "</span>")
+                     (str "<span class=\"num\">" (count (rejected-holds db)) "</span>")
+                     (esc "SOFT escalation として人間に届き、人間が却下したもの")])
+             (cells [(esc "台帳の総エントリ") (str "<span class=\"num\">" (count ledger) "</span>")
+                     (esc "append-only。この actor が台帳を書き換える経路は存在しない")])]))))
+
+(defn- batches-section [db]
+  (section
+   "生産バッチ (fibremfg.store/all-batches)"
+   (str "seed は " (code "fibremfg.store/sample-data!") "。"
+        (esc "「残容量」は表示時に ") (code "registry/shipment-weight-exceeded-checkable?")
+        (esc " で検算可能性を確かめてから 記録生産量 − 出荷実績 を再計算したもので、記録された値ではない。"))
+   (table ["batch" "材料" "fibre-type" "output-form" "記録生産量 kg" "denier" "強度 cN/tex"
+           "QC 検証" "登録" "出荷実績 kg" "残容量 kg" "最終評価日"]
+          (for [b (store/all-batches db)]
+            (cells [(code (:id b)) (esc (:material b)) (code (str (:fibre-type b)))
+                    (code (str (:output-form b)))
+                    (str "<span class=\"num\">" (esc (:weight-kg b)) "</span>")
+                    (str "<span class=\"num\">" (esc (:denier b)) "</span>")
+                    (str "<span class=\"num\">" (esc (:tenacity-cn-per-tex b)) "</span>")
+                    (flag (registry/batch-verified? b) "verified" "unverified")
+                    (flag (registry/batch-registered? b) "registered" "unregistered")
+                    (str "<span class=\"num\">" (esc (:shipped-weight-kg b)) "</span>")
+                    (if (registry/shipment-weight-exceeded-checkable? b 0.0)
+                      (str "<span class=\"num\">"
+                           (esc (- (double (:weight-kg b)) (double (:shipped-weight-kg b 0.0))))
+                           "</span>")
+                      "<span class=\"err\">検算不能</span>")
+                    (esc (:last-assessed b))])))))
+
+(defn- equipment-section [db]
+  (section
+   "設備 (fibremfg.store/all-equipment)"
+   (str (esc "保守作業予定は、設備の ") (code ":verified?") (esc " と ") (code ":registered?")
+        (esc " の両方が真であることを governor が独立に再確認したときだけ提案できる。advisor の申告は根拠にならない。"))
+   (table ["equipment" "種別" "検証" "登録" "最終保守日" "予定された保守日 (この実行で書かれた値)"]
+          (for [e (store/all-equipment db)]
+            (cells [(code (:id e)) (code (str (:kind e)))
+                    (flag (registry/equipment-verified? e) "verified" "unverified")
+                    (flag (registry/equipment-registered? e) "registered" "unregistered")
+                    (or (some-> (:last-maintenance-date e) esc) "<span class=\"muted\">なし</span>")
+                    (or (some-> (:last-scheduled-maintenance-date e) esc)
+                        "<span class=\"muted\">なし</span>")])))))
+
+(defn- maintenance-section [db]
+  (section
+   "保守作業予定 (fibremfg.store/all-maintenance)"
+   (str (esc "二重スケジュールの防止は ") (code ":status")
+        (esc " の値ではなく専用の ") (code ":scheduled?")
+        (esc " 事実で行う。maintenance-number は ") (code "fibremfg.registry/register-maintenance")
+        (esc " が採番した実際の値。"))
+   (table ["maintenance" "対象設備" "種別" "予定日" "scheduled?" "maintenance-number" "actuate-line?"]
+          (for [m (store/all-maintenance db)]
+            (cells [(code (:id m)) (code (:equipment-id m)) (code (str (:maintenance-type m)))
+                    (esc (:scheduled-date m))
+                    (flag (true? (:scheduled? m)) "scheduled" "not scheduled")
+                    (code (:maintenance-number m))
+                    (flag (not (true? (:actuate-line? m))) "false (提案のみ)" "true")])))))
+
+(defn- shipments-section [db]
+  (section
+   "出荷調整 (fibremfg.store/shipment / shipment-history)"
+   (str (esc "申請量は governor が ") (code "registry/shipment-weight-exceeded?")
+        (esc " でバッチ自身の記録値から独立に検算する。自己申告の重量は信用しない。"))
+   (table ["shipment" "対象バッチ" "申請量 kg" "仕向" "shipment-number"]
+          (for [id (shipment-ids db)
+                :let [s (store/shipment db id)]]
+            (cells [(code id) (code (:batch-id s))
+                    (str "<span class=\"num\">" (esc (:weight-kg s)) "</span>")
+                    (esc (:destination s))
+                    (code (:shipment-number s))])))))
+
+(defn- safety-section [db]
+  (section
+   "安全懸念 (fibremfg.store/safety-concerns)"
+   (str (esc "安全報告は ") (code ":stake :coordination/safety-concern")
+        (esc " として常に人間承認へ escalate する。設備が未検証・未登録であることを理由に安全報告を止めることは無い(下の concern-2 が実例)。"))
+   (table ["concern" "対象設備" "深刻度" "内容"]
+          (for [c (store/safety-concerns db)]
+            (cells [(code (:id c)) (code (:equipment-id c))
+                    (esc (str (:severity c))) (esc (:description c))])))))
+
+(defn- drafts-section [db]
+  (section
+   "レジストリ下書き (append-only)"
+   (str (esc "この actor が作るのは記録の DRAFT であって、紡糸・押出ラインの操作でも運送業者の手配でもない。証明書は ")
+        (code "status: draft-unsigned") (esc " のまま — 署名は人間の行為。"))
+   (str (table ["record_id" "kind" "maintenance_id" "equipment_id" "immutable"]
+               (for [r (store/maintenance-history db)]
+                 (cells [(code (get r "record_id")) (esc (get r "kind"))
+                         (code (get r "maintenance_id")) (code (get r "equipment_id"))
+                         (flag (true? (get r "immutable")) "true" "false")])))
+        (table ["record_id" "kind" "shipment_id" "immutable"]
+               (for [r (store/shipment-history db)]
+                 (cells [(code (get r "record_id")) (esc (get r "kind"))
+                         (code (get r "shipment_id"))
+                         (flag (true? (get r "immutable")) "true" "false")]))))))
+
+(defn- contract-section []
+  (section
+   "governor の閉じた許可リストとしきい値 (fibremfg.governor の実際の値)"
+   (str (esc "下の集合は ") (code "fibremfg.governor")
+        (esc " の var をそのまま読んで並べたもので、この文書のための書き写しではない。"))
+   (table ["定義" "値"]
+          [(cells [(code "governor/allowed-ops") (kw-list governor/allowed-ops)])
+           (cells [(code "governor/allowed-proposal-effects") (kw-list governor/allowed-proposal-effects)])
+           (cells [(code "governor/high-stakes") (kw-list governor/high-stakes)])
+           (cells [(code "governor/confidence-floor")
+                   (str "<span class=\"num\">" (esc governor/confidence-floor)
+                        "</span>" (esc " 未満は SOFT escalate (人間が承認しうる)"))])
+           (cells [(code "phase/write-ops") (kw-list phase/write-ops)])])))
+
+(defn- phase-section []
+  (section
+   "phase ゲート (fibremfg.phase/phases の実際の値)"
+   (str (esc "governor が通した提案でも、その phase で書き込みが有効化されていなければ hold になる。")
+        (code ":schedule-maintenance")
+        (esc " はどの phase の ") (code ":auto")
+        (esc " にも入らない — これはロールアウトの途中段階ではなく恒久的な構造。既定 phase は ")
+        (code (str phase/default-phase)) (esc "。"))
+   (table (into ["phase" "label"] (map #(str (name %)) (sort-by str phase/write-ops)))
+          (for [[n {:keys [label writes auto]}] (sort-by first phase/phases)]
+            (cells (into [(str "<span class=\"num\">" n "</span>"
+                               (when (= n phase/default-phase)
+                                 " <span class=\"badge\">既定</span>"))
+                          (esc label)]
+                         (for [o (sort-by str phase/write-ops)]
+                           (cond
+                             (contains? auto o) "<span class=\"ok\">自動コミット可</span>"
+                             (contains? writes o) "<span class=\"warn\">人間承認が必要</span>"
+                             :else "<span class=\"err\">この phase では不可</span>"))))))))
+
+(defn- hard-rules-section [db]
+  (section
+   "この実行で発火した HARD ルール"
+   (str (esc "HARD hold は phase でも人間承認でも覆せず、")
+        "<strong>" (esc "人間に届かない") "</strong>"
+        (esc "。下の行は台帳の ") (code ":violations")
+        (esc " を rule ごとに集計したもので、detail 文字列は governor が実際に書いたもの。"))
+   (table ["rule" "発火数" "governor が書いた detail"]
+          (for [{:keys [rule count details]} (hard-rule-tally db)]
+            (cells [(str "<span class=\"critical\">" (code (str rule)) "</span>")
+                    (str "<span class=\"num\">" count "</span>")
+                    (str/join "<br>" (map esc details))])))))
+
+(defn- escalation-section [runs]
+  (section
+   "人間の判断 (各スレッドの :audit channel より)"
+   (str (code "interrupt-before #{:request-approval}")
+        (esc " が actor を一時停止し、人間が ") (code ":approved") (esc " / ") (code ":rejected")
+        (esc " で再開する。ここに現れるのは SOFT な判断だけで、HARD hold はそもそもこの表に来ない。"))
+   (table ["thread" "監査事実" "op" "対象" "理由 / 承認者"]
+          (for [{:keys [thread t op subject by reason confidence]} (approval-events runs)]
+            (cells [(code thread)
+                    (case t
+                      :approval-requested (str "<span class=\"warn\">" (esc (str t)) "</span>")
+                      :approval-granted (str "<span class=\"ok\">" (esc (str t)) "</span>")
+                      (str "<span class=\"critical\">" (esc (str t)) "</span>"))
+                    (code (str op)) (code subject)
+                    (str/join " " (remove nil?
+                                          [(when reason (str "reason=" (code (str reason))))
+                                           (when confidence (str "confidence=<span class=\"num\">"
+                                                                 (esc confidence) "</span>"))
+                                           (when by (str "by=" (code by)))]))])))))
+
+(defn- approver-section [db runs]
+  (let [probe (approver-probe db runs)
+        durable (remove #(str/includes? (:surface %) "永続化されない") probe)
+        durable-hits (mapcat :hits durable)
+        transient-hits (mapcat :hits (filter #(str/includes? (:surface %) "永続化されない") probe))
+        granted (filter #(= :approval-granted (:t %)) (approval-events runs))
+        rejected (filter #(= :approval-rejected (:t %)) (approval-events runs))]
+    (section
+     "承認者の帰属 — この repo で実測した結果"
+     (str (esc "この節はコードを読んで書いたのではなく、実行後のストアと台帳を")
+          "<strong>" (esc "実際に走査して") "</strong>"
+          (esc "生成している。承認者キー ") (kw-list approver-keys)
+          (esc " をすべての永続面と実行時 audit で探した結果が下の表。実装が直れば、このページも次の生成で自動的に言うことが変わる。"))
+     (str
+      (table ["面" "レコード数" "承認者キーの検出"]
+             (for [{:keys [surface n hits]} probe]
+               (cells [(esc surface) (str "<span class=\"num\">" n "</span>")
+                       (if (seq hits)
+                         (str "<span class=\"ok\">✔ "
+                              (str/join "、" (map (fn [[k v]] (str (code (str k)) "=" (code (str v)))) hits))
+                              "</span>")
+                         "<span class=\"err\">✘ 承認者キーなし</span>")])))
+      "    <p>"
+      (cond
+        (seq durable-hits)
+        (str "<span class=\"ok\">" (esc "承認者 id は永続面に残っている。") "</span>"
+             (esc "上表のとおり、承認済みレコードから承認者を読み戻せる。"))
+
+        (seq transient-hits)
+        (str "<span class=\"err\">"
+             (esc "承認者 id は永続面に一切残っていない。")
+             "</span> "
+             (esc "この実行では ") (str "<span class=\"num\">" (count granted) "</span>")
+             (esc " 件の承認と ") (str "<span class=\"num\">" (count rejected) "</span>")
+             (esc " 件の却下が実際に起きており、承認者 ")
+             (code (or (some :by granted) "?"))
+             (esc " は実行中の ") (code ":audit")
+             (esc " channel には現れる。しかし ") (code "fibremfg.operation")
+             (esc " の :request-approval ノードが承認者を載せるのは record の ")
+             (code ":payload") (esc " であり、") (code "fibremfg.store/commit-record!")
+             (esc " が domain effect で読むのは ") (code ":value")
+             (esc " なので、永続化の時点で落ちる。")
+             "<strong>"
+             (esc "したがってこのページは「誰も承認していない」ことと「承認者をストアが保持していない」ことを区別できない — 後者である、と明示しておく。")
+             "</strong> "
+             (esc "却下側はさらに手前で落ちており、却下した人間の id は実行時 audit にも入らない(")
+             (code "governor/hold-fact") (esc " が ") (code ":by") (esc " を持たないため)。")
+             (esc "これは actor の SSoT 意味論の問題なので、この生成コミットでは直さない。"))
+
+        :else
+        (str "<span class=\"muted\">"
+             (esc "この実行では人間承認そのものが発生していないため、承認者の保持可否を測れていない。")
+             "</span>"))
+      "</p>\n"))))
+
+(defn- ledger-section [db]
+  (section
+   "監査台帳 (fibremfg.store/ledger、append-only)"
+   (str (esc "この actor が台帳を書き換える経路は存在しない。行の順序は実行順そのもの。")
+        (code ":basis") (esc " が空で ") (code ":phase-reason")
+        (esc " を持つ行は phase による hold、") (code ":basis")
+        (esc " が埋まっている ") (code ":governor-hold")
+        (esc " が HARD hold。"))
+   (table ["#" "fact" "op" "対象" "処分" "basis" "confidence" "detail"]
+          (map-indexed
+           (fn [i {:keys [t op subject disposition basis violations confidence
+                          phase-reason phase]}]
+             (cells [(str "<span class=\"num\">" (inc i) "</span>")
+                     (case t
+                       :committed (str "<span class=\"ok\">" (esc (str t)) "</span>")
+                       :governor-hold (if (seq basis)
+                                        (str "<span class=\"critical\">" (esc (str t)) "</span>")
+                                        (str "<span class=\"warn\">" (esc (str t)) "</span>"))
+                       (str "<span class=\"warn\">" (esc (str t)) "</span>"))
+                     (code (str op)) (code subject)
+                     (esc (str disposition))
+                     (if (seq basis)
+                       (str/join "<br>" (map #(code (str %)) basis))
+                       (if phase-reason
+                         (str (code (str phase-reason)) " <span class=\"muted\">(phase "
+                              (esc phase) ")</span>")
+                         "<span class=\"muted\">—</span>"))
+                     (if (some? confidence)
+                       (str "<span class=\"num\">" (esc confidence) "</span>")
+                       "<span class=\"muted\">—</span>")
+                     (if (seq violations)
+                       (str/join "<br>" (map (comp esc :detail) violations))
+                       "<span class=\"muted\">—</span>")]))
+           (store/ledger db)))))
+
+(defn- runs-section [runs]
+  (section
+   "実行したコーディネーション要求"
+   (str (esc "1行 = 1回の ") (code "langgraph.graph/run*")
+        (esc "。「グラフ状態」は actor が返した ") (code ":status")
+        (esc " をそのまま出したもの(") (code ":complete") (esc " / ") (code ":interrupted")
+        (esc ")。"))
+   (table ["thread" "phase" "op" "シナリオ" "人間の判断" "処分" "グラフ状態"]
+          (for [{:keys [thread phase label request approval status result]} runs
+                :let [d (get-in result [:state :disposition])]]
+            (cells [(code thread)
+                    (str "<span class=\"num\">" (esc phase) "</span>")
+                    (code (str (:op request)))
+                    (esc label)
+                    (if approval
+                      (str (case (:status approval)
+                             :approved "<span class=\"ok\">承認</span>"
+                             "<span class=\"critical\">却下</span>")
+                           " " (code (:by approval)))
+                      "<span class=\"muted\">人間に届いていない</span>")
+                    (case d
+                      :commit "<span class=\"ok\">commit</span>"
+                      :hold "<span class=\"critical\">hold</span>"
+                      (str "<span class=\"warn\">" (esc (str d)) "</span>"))
+                    (code (str status))])))))
+
+;; ----------------------------- document -----------------------------
+
+(defn render
+  "Pure: `{:db .. :runs ..}` (as returned by `run-demo!`) -> the whole
+  HTML document. No clock, no randomness, no map-iteration-order
+  dependence."
+  [{:keys [db runs]}]
+  (str
+     "<!doctype html>\n<html lang=\"ja\"><head><meta charset=\"utf-8\">\n"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+     "<title>cloud-itonami-isic-2030 · 化学繊維プラント運用コーディネーター Operator Console</title>\n"
+     "<style>\n" (jp-go-dds.skin/dds+skin) "\n</style>\n"
+     "</head><body>\n"
+     "<header class=\"bar\">\n"
+     "  <h1>化学繊維製造 (ISIC 2030) — プラント運用コーディネーター Operator Console</h1>\n"
+     "</header>\n"
+     "<p><span class=\"badge\">read-only sample</span> "
+     "<span class=\"badge\">governor-gated</span> "
+     "<span class=\"badge\">提案のみ / 紡糸・押出ラインの直接操作なし</span></p>\n"
+     "<div class=\"banner\">\n"
+     "  <p>このページは <code>clojure -M:dev:render-html</code> がビルド時に "
+     "<code>fibremfg.operation</code> の StateGraph を実際に走らせ、その結果の "
+     "<code>fibremfg.store</code> から生成している。数値・id・判定はすべて実行結果で、"
+     "手書きの値は無い。HARD hold が 0 件なら生成器は例外を投げてファイルを書かない。</p>\n"
+     "</div>\n"
+     "<main>\n"
+     (summary-section db runs)
+     (runs-section runs)
+     (batches-section db)
+     (equipment-section db)
+     (maintenance-section db)
+     (shipments-section db)
+     (safety-section db)
+     (drafts-section db)
+     (contract-section)
+     (phase-section)
+     (hard-rules-section db)
+     (escalation-section runs)
+     (approver-section db runs)
+     (ledger-section db)
+     "</main>\n"
+     "<footer>\n"
+     "  <p>生成: <code>fibremfg.render-html/-main</code> — "
+     "seed は <code>fibremfg.store/sample-data!</code>、"
+     "advisor は <code>fibremfg.advisor/mock-advisor</code>"
+     "(1件だけ意図的に改竄した advisor と、1件だけ確信度を下げた advisor を使用)。"
+     "決定的: 時刻・乱数を読まず、走査順は append-only ログの順序か明示ソートのみ。"
+     "同じ入力から2回生成すればバイト単位で一致する。</p>\n"
+     "  <p>この actor は提案(DRAFT)しか作らない。紡糸・押出ラインの操作、"
+     "運送業者の手配、証明書への署名はいずれも行わない。</p>\n"
+     "</footer>\n"
+     "</body></html>\n"))
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        {:keys [db runs] :as demo} (run-demo!)
+        hs (hard-holds db)]
+    (when (empty? hs)
+      (throw (ex-info "no governor hold fact on the ledger — refusing to write a console that shows no real hold"
+                      {:ledger-facts (count (store/ledger db))})))
+    (let [html (render demo)]
+      (spit out html)
+      (println "wrote" out
+               (str "(" (count html) " bytes, "
+                    (count runs) " actor runs, "
+                    (count (store/ledger db)) " ledger facts, "
+                    (count hs) " HARD holds over "
+                    (count (hard-rule-tally db)) " distinct rules, "
+                    (count (store/maintenance-history db)) " maintenance drafts, "
+                    (count (store/shipment-history db)) " shipment drafts)")))))
