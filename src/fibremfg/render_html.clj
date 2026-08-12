@@ -767,16 +767,33 @@
 (defn -main [& args]
   (let [out (or (first args) "docs/samples/operator-console.html")
         {:keys [db runs] :as demo} (run-demo!)
-        hs (hard-holds db)]
+        hs (hard-holds db)
+        cs (commits db)]
+    ;; A console for a GOVERNED actor that shows no real refusal is
+    ;; theatre -- refuse to write one.
     (when (empty? hs)
       (throw (ex-info "no governor hold fact on the ledger — refusing to write a console that shows no real hold"
                       {:ledger-facts (count (store/ledger db))})))
-    (let [html (render demo)]
-      (spit out html)
+    ;; ...and one that shows no commit at all is not evidence of an
+    ;; ACTOR: a governor that holds everything is indistinguishable
+    ;; from a broken pipeline. Both invariants are checked before any
+    ;; byte is written, so a failing run leaves the previous console
+    ;; untouched rather than replacing it with a misleading one.
+    (when (empty? cs)
+      (throw (ex-info "no :committed fact on the ledger — refusing to write a console that shows no clean path"
+                      {:ledger-facts (count (store/ledger db))})))
+    (let [html (render demo)
+          f (java.io.File. ^String out)]
+      (when-let [p (.getParentFile f)] (.mkdirs p))
+      (spit f html)
       (println "wrote" out
-               (str "(" (count html) " bytes, "
+               ;; `(count html)` would be UTF-16 CHARS, not bytes -- this
+               ;; page is largely Japanese, so that under-reports the real
+               ;; file size by ~6%. Report what the filesystem holds.
+               (str "(" (.length f) " bytes, "
                     (count runs) " actor runs, "
                     (count (store/ledger db)) " ledger facts, "
+                    (count cs) " commits, "
                     (count hs) " HARD holds over "
                     (count (hard-rule-tally db)) " distinct rules, "
                     (count (store/maintenance-history db)) " maintenance drafts, "
