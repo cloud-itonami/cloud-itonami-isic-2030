@@ -2,7 +2,7 @@
   "Build-time HTML renderer for `docs/samples/operator-console.html`.
 
   Closes flagship checklist item 2 for this repo: it previously had a
-  README and a demo driver (`clojure -M:dev:run`) but NO operator page
+  README and a demo driver (`kbb -M:dev:run`) but NO operator page
   and no generator. Nothing on the generated page is hand-written --
   `run-demo!` actually drives this repo's own actor stack
   (`fibremfg.operation`'s langgraph StateGraph -> `fibremfg.advisor`
@@ -21,7 +21,7 @@
   HARD governor holds. A console for a governed actor that shows no
   real refusal is theatre, and this generator will not emit one.
 
-  Usage: `clojure -M:dev:render-html [out-file]`
+  Usage: `kbb -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
   (:require [jp-go-dds.skin]
             [kotoba.lang.text :as str]
@@ -731,7 +731,7 @@
      "<span class=\"badge\">governor-gated</span> "
      "<span class=\"badge\">提案のみ / 紡糸・押出ラインの直接操作なし</span></p>\n"
      "<div class=\"banner\">\n"
-     "  <p>このページは <code>clojure -M:dev:render-html</code> がビルド時に "
+     "  <p>このページは <code>kbb -M:dev:render-html</code> がビルド時に "
      "<code>fibremfg.operation</code> の StateGraph を実際に走らせ、その結果の "
      "<code>fibremfg.store</code> から生成している。数値・id・判定はすべて実行結果で、"
      "手書きの値は無い。HARD hold が 0 件なら生成器は例外を投げてファイルを書かない。</p>\n"
