@@ -1,0 +1,45 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; The README has no "Robotics premise" section; its Scope names the plant
+;; this actor coordinates (ISIC 2030): spinning/extrusion/drawing of
+;; synthetic polymers or regenerated cellulose into continuous filament,
+;; staple fibre or tow. The physical work of that plant taken here: quench
+;; cooling of melt-spun filaments below the glass transition before they are
+;; taken up, doffing full packages from the winder, and carrying baled
+;; staple fibre to the shipping store.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-2030"
+ :cases
+ [{:id :filament-quench
+   :kind :thermal
+   :procedure "melt-spun polyester filament leaves the spinneret at 290 C into 20 C cross-flow quench air; its core must fall below 80 C before the take-up godet (filament as a flat half-thickness, core adiabatic)"
+   :params {:thickness-m 1.5e-5 :conductivity-w-mk 0.2 :density-kg-m3 1300.0 :specific-heat-j-kgk 1800.0
+            :t0-c 290.0 :t-hot-c 20.0 :h-front-w-m2k 400.0 :h-back-w-m2k 0.0
+            :threshold-c 80.0 :threshold-direction :falling :duration-s 1.0 :nodes 5}
+   :sweep {:param :thickness-m :values [5.0e-6 1.0e-5 1.5e-5 2.5e-5 4.0e-5]}
+   :quantity :time-to-threshold-s
+   :limit {:max 0.2 :basis "estimate: time the filament spends in the quench chimney before the first godet, taken as 0.2 s; quench-air heat-transfer coefficient 400 W/m2K is assumed"}
+   :boundary {:lo 2.0e-6 :hi 1.0e-4}}
+  {:id :package-doffing
+   :kind :manipulator
+   :procedure "doffing arm lifts a full filament package off the winder chuck onto the creel trolley"
+   :params {:l1-m 0.55 :l2-m 0.45 :m1-kg 8.0 :m2-kg 5.0
+            :from [0.60 0.30] :to [0.30 0.80] :duration-s 3.0 :steps 500}
+   :sweep {:param :payload-kg :values [5.0 10.0 15.0 20.0 25.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 250.0 :basis "estimate: continuous shoulder torque of a ~20 kg-payload industrial arm class"}
+   :boundary {:lo 1.0 :hi 80.0}}
+  {:id :staple-bale-to-store
+   :kind :transport
+   :procedure "AMR carries a pressed bale of staple fibre from the baling press to the shipping store"
+   :params {:mass-kg 250.0 :distance-m 70.0 :v-max-mps 1.2 :a-max-mps2 0.4
+            :brake-decel-mps2 0.8 :drive-force-n 600.0 :crr 0.015
+            :cog-height-m 0.35 :payload-cog-height-m 0.90 :support-half-length-m 0.50 :max-time-s 3600.0}
+   :sweep {:param :payload-kg :values [150.0 250.0 350.0 500.0 700.0]}
+   :quantity :cycle-time-s
+   :limit {:max 75.0 :basis "estimate: one store leg within 75 s keeps pace with the baling press"}
+   :boundary {:lo 50.0 :hi 3000.0}}]}
