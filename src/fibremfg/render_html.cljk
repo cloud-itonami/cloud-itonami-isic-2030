@@ -23,7 +23,7 @@
 
   Usage: `kbb -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
-  (:require [jp-go-dds.skin]
+  (:require [kotoba.io :as kio] [jp-go-dds.skin]
             [kotoba.lang.text :as str]
             [langgraph.graph :as g]
             [fibremfg.advisor :as advisor]
@@ -783,14 +783,14 @@
       (throw (ex-info "no :committed fact on the ledger — refusing to write a console that shows no clean path"
                       {:ledger-facts (count (store/ledger db))})))
     (let [html (render demo)
-          f (java.io.File. ^String out)]
-      (when-let [p (.getParentFile f)] (.mkdirs p))
+          f (kio/file ^String out)]
+      (when-let [p (kio/parent-file f)] (kio/mkdirs p))
       (spit f html)
       (println "wrote" out
                ;; `(count html)` would be UTF-16 CHARS, not bytes -- this
                ;; page is largely Japanese, so that under-reports the real
                ;; file size by ~6%. Report what the filesystem holds.
-               (str "(" (.length f) " bytes, "
+               (str "(" (kio/length f) " bytes, "
                     (count runs) " actor runs, "
                     (count (store/ledger db)) " ledger facts, "
                     (count cs) " commits, "
